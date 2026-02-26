@@ -1,4 +1,6 @@
+use futures_util::{Stream, StreamExt};
 use reqwest::{Client, StatusCode};
+use reqwest_eventsource::{Event, EventSource};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -6,8 +8,6 @@ use std::fmt;
 // --- Models ---
 
 /// Represents the data structure returned by DynaRust.
-/// We use a generic type `T` so users can deserialize directly into their own structs.
-/// It defaults to `serde_json::Value` if no specific type is provided.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VersionedValue<T = Value> {
     pub value: T,
@@ -16,32 +16,38 @@ pub struct VersionedValue<T = Value> {
     pub owner: String,
 }
 
+#[derive(Serialize)]
+struct AuthRequest<'a> {
+    secret: &'a str,
+}
+
+#[derive(Deserialize)]
+struct AuthResponse {
+    token: Option<String>,
+    #[allow(dead_code)] // status is returned on registration
+    status: Option<String>,
+}
+
 // --- Configuration & Client ---
 
 /// The main client used to interact with the DynaRust cluster.
 #[derive(Debug, Clone)]
 pub struct DynaClient {
-    /// The base URL of the DynaRust node (e.g., "http://127.0.0.1:6660")
     pub base_url: String,
-    /// The internal HTTP client used for connection pooling
     http_client: Client,
-    /// Optional JWT token for operations that require auth (PUT, DELETE)
     pub jwt_token: Option<String>,
 }
 
 // --- Error Handling ---
 
-/// Standardized errors for DynaRust interactions
 #[derive(Debug)]
 pub enum DynaError {
-    /// Network or Serialization errors from reqwest
     RequestFailed(reqwest::Error),
-    /// 404 Not Found (Key or Table does not exist)
     NotFound,
-    /// 401 Unauthorized (Missing/invalid JWT, or not the owner)
     Unauthorized,
-    /// Any other unhandled HTTP status codes
     UnexpectedStatus(u16, String),
+    ParseError(String),
+    StreamError(String),
 }
 
 impl std::error::Error for DynaError {}
@@ -55,6 +61,8 @@ impl fmt::Display for DynaError {
             DynaError::UnexpectedStatus(code, msg) => {
                 write!(f, "Unexpected status {}: {}", code, msg)
             }
+            DynaError::ParseError(msg) => write!(f, "Failed to parse data: {}", msg),
+            DynaError::StreamError(msg) => write!(f, "SSE Stream error: {}", msg),
         }
     }
 }
@@ -63,31 +71,65 @@ impl fmt::Display for DynaError {
 
 impl DynaClient {
     /// Creates a new configured instance of the DynaClient.
-    /// 
-    /// # Example
-    /// ```
-    /// let client = DynaClient::new("http://localhost:6660");
-    /// ```
     pub fn new(base_url: &str) -> Self {
         Self {
-            // Trim trailing slashes to prevent double-slashes in URL formatting
             base_url: base_url.trim_end_matches('/').to_string(),
             http_client: Client::new(),
             jwt_token: None,
         }
     }
 
-    /// Attaches a JWT token to the client for authenticated requests (PUT/DELETE).
+    /// Manually attaches a JWT token to the client.
     pub fn set_token(&mut self, token: String) {
         self.jwt_token = Some(token);
     }
 
-    /// Fetches a value from the DynaRust database.
-    /// According to the docs, GET requests do NOT require authentication.
-    /// 
-    /// # Arguments
-    /// * `table` - The table name (e.g., "default")
-    /// * `key` - The key to retrieve
+    /// Helper to get the token or return an Unauthorized error
+    fn get_bearer(&self) -> Result<String, DynaError> {
+        self.jwt_token
+            .as_ref()
+            .map(|t| format!("Bearer {}", t))
+            .ok_or(DynaError::Unauthorized)
+    }
+
+    // --- Core API Methods ---
+
+    /// Registers a new user or logs in an existing one.
+    /// Automatically saves the JWT token to the client instance if successful.
+    pub async fn auth(&mut self, user: &str, secret: &str) -> Result<(), DynaError> {
+        let url = format!("{}/auth/{}", self.base_url, user);
+        let payload = AuthRequest { secret };
+
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(DynaError::RequestFailed)?;
+
+        if response.status().is_success() {
+            let auth_data = response
+                .json::<AuthResponse>()
+                .await
+                .map_err(DynaError::RequestFailed)?;
+
+            // If a token is returned (login), store it. 
+            // If it's just a status message (registration), we might need to log in again or wait for next call.
+            if let Some(token) = auth_data.token {
+                self.jwt_token = Some(token);
+            }
+            Ok(())
+        } else if response.status() == StatusCode::UNAUTHORIZED {
+            Err(DynaError::Unauthorized)
+        } else {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            Err(DynaError::UnexpectedStatus(status.as_u16(), text))
+        }
+    }
+
+    /// Fetches a value from the DynaRust database (No auth required).
     pub async fn get_value<T: for<'de> Deserialize<'de>>(
         &self,
         table: &str,
@@ -116,5 +158,104 @@ impl DynaClient {
                 Err(DynaError::UnexpectedStatus(status.as_u16(), text))
             }
         }
+    }
+
+    /// Creates or updates a value. Requires the client to be authenticated as the owner.
+    pub async fn put_value<T: Serialize + for<'de> Deserialize<'de>>(
+        &self,
+        table: &str,
+        key: &str,
+        value: &T,
+    ) -> Result<VersionedValue<T>, DynaError> {
+        let bearer = self.get_bearer()?;
+        let url = format!("{}/{}/key/{}", self.base_url, table, key);
+
+        let response = self
+            .http_client
+            .put(&url)
+            .header("Authorization", bearer)
+            .json(value)
+            .send()
+            .await
+            .map_err(DynaError::RequestFailed)?;
+
+        match response.status() {
+            StatusCode::CREATED | StatusCode::OK => {
+                let data = response
+                    .json::<VersionedValue<T>>()
+                    .await
+                    .map_err(DynaError::RequestFailed)?;
+                Ok(data)
+            }
+            StatusCode::UNAUTHORIZED => Err(DynaError::Unauthorized),
+            status => {
+                let text = response.text().await.unwrap_or_default();
+                Err(DynaError::UnexpectedStatus(status.as_u16(), text))
+            }
+        }
+    }
+
+    /// Deletes a value. Requires the client to be authenticated as the owner.
+    pub async fn delete_value(&self, table: &str, key: &str) -> Result<(), DynaError> {
+        let bearer = self.get_bearer()?;
+        let url = format!("{}/{}/key/{}", self.base_url, table, key);
+
+        let response = self
+            .http_client
+            .delete(&url)
+            .header("Authorization", bearer)
+            .send()
+            .await
+            .map_err(DynaError::RequestFailed)?;
+
+        match response.status() {
+            StatusCode::OK => Ok(()),
+            StatusCode::NOT_FOUND => Err(DynaError::NotFound),
+            StatusCode::UNAUTHORIZED => Err(DynaError::Unauthorized),
+            status => {
+                let text = response.text().await.unwrap_or_default();
+                Err(DynaError::UnexpectedStatus(status.as_u16(), text))
+            }
+        }
+    }
+
+    /// Subscribes to a key using Server-Sent Events (SSE).
+    /// Yields a stream of real-time updates for the generic type T.
+    pub async fn subscribe<T: for<'de> Deserialize<'de> + 'static>(
+        &self,
+        table: &str,
+        key: &str,
+    ) -> Result<impl Stream<Item = Result<VersionedValue<T>, DynaError>>, DynaError> {
+        let url = format!("{}/{}/subscribe/{}", self.base_url, table, key);
+
+        // We use reqwest_eventsource to handle the SSE connection
+        let mut event_source = EventSource::get(&url);
+
+        // Convert the raw EventSource into a clean Rust stream of typed structs
+        let stream = async_stream::stream! {
+            while let Some(event) = event_source.next().await {
+                match event {
+                    Ok(Event::Open) => continue, // Connection established
+                    Ok(Event::Message(message)) => {
+                        // DynaRust pushes JSON. We parse it: {"event": "Updated", "value": {...}}
+                        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&message.data);
+                        if let Ok(json_obj) = parsed {
+                            if let Some(val) = json_obj.get("value") {
+                                match serde_json::from_value::<VersionedValue<T>>(val.clone()) {
+                                    Ok(versioned_val) => yield Ok(versioned_val),
+                                    Err(e) => yield Err(DynaError::ParseError(e.to_string())),
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        yield Err(DynaError::StreamError(e.to_string()));
+                        break; // Stop streaming on connection error
+                    }
+                }
+            }
+        };
+
+        Ok(Box::pin(stream))
     }
 }
