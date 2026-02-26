@@ -135,11 +135,18 @@ impl DynaClient {
         table: &str,
         key: &str,
     ) -> Result<VersionedValue<T>, DynaError> {
+        // Note: reqwest handles spaces in URLs automatically, but consider URL-encoding keys in production!
         let url = format!("{}/{}/key/{}", self.base_url, table, key);
 
-        let response = self
-            .http_client
-            .get(&url)
+        // Build the base request
+        let mut request = self.http_client.get(&url);
+
+        // Attach the Authorization header if we have a token
+        if let Ok(bearer) = self.get_bearer() {
+            request = request.header("Authorization", bearer);
+        }
+
+        let response = request
             .send()
             .await
             .map_err(DynaError::RequestFailed)?;
