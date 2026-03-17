@@ -202,6 +202,42 @@ impl DynaClient {
         }
     }
 
+    /// Partially updates a value. Requires the client to be authenticated as the owner.
+    pub async fn patch_value<T: Serialize + for<'de> Deserialize<'de>>(
+        &self,
+        table: &str,
+        key: &str,
+        value: &T,
+    ) -> Result<VersionedValue<T>, DynaError> {
+        let bearer = self.get_bearer()?;
+        let url = format!("{}/{}/key/{}", self.base_url, table, key);
+
+        let response = self
+            .http_client
+            .patch(&url)
+            .header("Authorization", bearer)
+            .json(value)
+            .send()
+            .await
+            .map_err(DynaError::RequestFailed)?;
+
+        match response.status() {
+            StatusCode::OK => {
+                let data = response
+                    .json::<VersionedValue<T>>()
+                    .await
+                    .map_err(DynaError::RequestFailed)?;
+                Ok(data)
+            }
+            StatusCode::UNAUTHORIZED => Err(DynaError::Unauthorized),
+            StatusCode::NOT_FOUND => Err(DynaError::NotFound),
+            status => {
+                let text = response.text().await.unwrap_or_default();
+                Err(DynaError::UnexpectedStatus(status.as_u16(), text))
+            }
+        }
+    }
+
     /// Deletes a value. Requires the client to be authenticated as the owner.
     pub async fn delete_value(&self, table: &str, key: &str) -> Result<(), DynaError> {
         let bearer = self.get_bearer()?;
