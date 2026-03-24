@@ -4,6 +4,7 @@ use reqwest_eventsource::{Event, EventSource};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
+use std::sync::{Arc, RwLock};
 
 // --- Models ---
 
@@ -31,11 +32,22 @@ struct AuthResponse {
 // --- Configuration & Client ---
 
 /// The main client used to interact with the DynaRust cluster.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DynaClient {
     pub base_url: String,
     http_client: Client,
-    pub jwt_token: Option<String>,
+    pub jwt_token: Arc<RwLock<Option<String>>>,
+    credentials: Arc<RwLock<Option<(String, String)>>>,
+}
+
+impl fmt::Debug for DynaClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DynaClient")
+            .field("base_url", &self.base_url)
+            .field("http_client", &self.http_client)
+            .field("jwt_token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 // --- Error Handling ---
@@ -75,18 +87,21 @@ impl DynaClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             http_client: Client::new(),
-            jwt_token: None,
+            jwt_token: Arc::new(RwLock::new(None)),
+            credentials: Arc::new(RwLock::new(None)),
         }
     }
 
     /// Manually attaches a JWT token to the client.
-    pub fn set_token(&mut self, token: String) {
-        self.jwt_token = Some(token);
+    pub fn set_token(&self, token: String) {
+        let mut token_lock = self.jwt_token.write().unwrap();
+        *token_lock = Some(token);
     }
 
     /// Helper to get the token or return an Unauthorized error
     fn get_bearer(&self) -> Result<String, DynaError> {
-        self.jwt_token
+        let token_lock = self.jwt_token.read().unwrap();
+        token_lock
             .as_ref()
             .map(|t| format!("Bearer {}", t))
             .ok_or(DynaError::Unauthorized)
@@ -96,7 +111,7 @@ impl DynaClient {
 
     /// Registers a new user or logs in an existing one.
     /// Automatically saves the JWT token to the client instance if successful.
-    pub async fn auth(&mut self, user: &str, secret: &str) -> Result<(), DynaError> {
+    pub async fn auth(&self, user: &str, secret: &str) -> Result<(), DynaError> {
         let url = format!("{}/auth/{}", self.base_url, user);
         let payload = AuthRequest { secret };
 
@@ -114,10 +129,12 @@ impl DynaClient {
                 .await
                 .map_err(DynaError::RequestFailed)?;
 
-            // If a token is returned (login), store it. 
-            // If it's just a status message (registration), we might need to log in again or wait for next call.
+            // If a token is returned (login), store it and the credentials.
             if let Some(token) = auth_data.token {
-                self.jwt_token = Some(token);
+                let mut token_lock = self.jwt_token.write().unwrap();
+                *token_lock = Some(token);
+                let mut creds_lock = self.credentials.write().unwrap();
+                *creds_lock = Some((user.to_string(), secret.to_string()));
             }
             Ok(())
         } else if response.status() == StatusCode::UNAUTHORIZED {
@@ -129,40 +146,59 @@ impl DynaClient {
         }
     }
 
+    /// Internal helper to re-authenticate using stored credentials.
+    async fn reauth(&self) -> Result<(), DynaError> {
+        let creds = {
+            let creds_lock = self.credentials.read().unwrap();
+            creds_lock.clone()
+        };
+        
+        if let Some((user, secret)) = creds {
+            self.auth(&user, &secret).await
+        } else {
+            Err(DynaError::Unauthorized)
+        }
+    }
+
     /// Fetches a value from the DynaRust database (No auth required).
     pub async fn get_value<T: for<'de> Deserialize<'de>>(
         &self,
         table: &str,
         key: &str,
     ) -> Result<VersionedValue<T>, DynaError> {
-        // Note: reqwest handles spaces in URLs automatically, but consider URL-encoding keys in production!
-        let url = format!("{}/{}/key/{}", self.base_url, table, key);
+        let mut retried = false;
+        loop {
+            let url = format!("{}/{}/key/{}", self.base_url, table, key);
+            let mut request = self.http_client.get(&url);
 
-        // Build the base request
-        let mut request = self.http_client.get(&url);
-
-        // Attach the Authorization header if we have a token
-        if let Ok(bearer) = self.get_bearer() {
-            request = request.header("Authorization", bearer);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(DynaError::RequestFailed)?;
-
-        match response.status() {
-            StatusCode::OK => {
-                let data = response
-                    .json::<VersionedValue<T>>()
-                    .await
-                    .map_err(DynaError::RequestFailed)?;
-                Ok(data)
+            if let Ok(bearer) = self.get_bearer() {
+                request = request.header("Authorization", bearer);
             }
-            StatusCode::NOT_FOUND => Err(DynaError::NotFound),
-            status => {
-                let text = response.text().await.unwrap_or_default();
-                Err(DynaError::UnexpectedStatus(status.as_u16(), text))
+
+            let response = request
+                .send()
+                .await
+                .map_err(DynaError::RequestFailed)?;
+
+            match response.status() {
+                StatusCode::OK => {
+                    return response
+                        .json::<VersionedValue<T>>()
+                        .await
+                        .map_err(DynaError::RequestFailed);
+                }
+                StatusCode::NOT_FOUND => return Err(DynaError::NotFound),
+                StatusCode::UNAUTHORIZED if !retried => {
+                    if self.reauth().await.is_ok() {
+                        retried = true;
+                        continue;
+                    }
+                    return Err(DynaError::Unauthorized);
+                }
+                status => {
+                    let text = response.text().await.unwrap_or_default();
+                    return Err(DynaError::UnexpectedStatus(status.as_u16(), text));
+                }
             }
         }
     }
@@ -174,30 +210,38 @@ impl DynaClient {
         key: &str,
         value: &T,
     ) -> Result<VersionedValue<T>, DynaError> {
-        let bearer = self.get_bearer()?;
-        let url = format!("{}/{}/key/{}", self.base_url, table, key);
+        let mut retried = false;
+        loop {
+            let bearer = self.get_bearer()?;
+            let url = format!("{}/{}/key/{}", self.base_url, table, key);
 
-        let response = self
-            .http_client
-            .put(&url)
-            .header("Authorization", bearer)
-            .json(value)
-            .send()
-            .await
-            .map_err(DynaError::RequestFailed)?;
+            let response = self
+                .http_client
+                .put(&url)
+                .header("Authorization", bearer)
+                .json(value)
+                .send()
+                .await
+                .map_err(DynaError::RequestFailed)?;
 
-        match response.status() {
-            StatusCode::CREATED | StatusCode::OK => {
-                let data = response
-                    .json::<VersionedValue<T>>()
-                    .await
-                    .map_err(DynaError::RequestFailed)?;
-                Ok(data)
-            }
-            StatusCode::UNAUTHORIZED => Err(DynaError::Unauthorized),
-            status => {
-                let text = response.text().await.unwrap_or_default();
-                Err(DynaError::UnexpectedStatus(status.as_u16(), text))
+            match response.status() {
+                StatusCode::CREATED | StatusCode::OK => {
+                    return response
+                        .json::<VersionedValue<T>>()
+                        .await
+                        .map_err(DynaError::RequestFailed);
+                }
+                StatusCode::UNAUTHORIZED if !retried => {
+                    if self.reauth().await.is_ok() {
+                        retried = true;
+                        continue;
+                    }
+                    return Err(DynaError::Unauthorized);
+                }
+                status => {
+                    let text = response.text().await.unwrap_or_default();
+                    return Err(DynaError::UnexpectedStatus(status.as_u16(), text));
+                }
             }
         }
     }
@@ -209,55 +253,73 @@ impl DynaClient {
         key: &str,
         value: &T,
     ) -> Result<VersionedValue<T>, DynaError> {
-        let bearer = self.get_bearer()?;
-        let url = format!("{}/{}/key/{}", self.base_url, table, key);
+        let mut retried = false;
+        loop {
+            let bearer = self.get_bearer()?;
+            let url = format!("{}/{}/key/{}", self.base_url, table, key);
 
-        let response = self
-            .http_client
-            .patch(&url)
-            .header("Authorization", bearer)
-            .json(value)
-            .send()
-            .await
-            .map_err(DynaError::RequestFailed)?;
+            let response = self
+                .http_client
+                .patch(&url)
+                .header("Authorization", bearer)
+                .json(value)
+                .send()
+                .await
+                .map_err(DynaError::RequestFailed)?;
 
-        match response.status() {
-            StatusCode::OK => {
-                let data = response
-                    .json::<VersionedValue<T>>()
-                    .await
-                    .map_err(DynaError::RequestFailed)?;
-                Ok(data)
-            }
-            StatusCode::UNAUTHORIZED => Err(DynaError::Unauthorized),
-            StatusCode::NOT_FOUND => Err(DynaError::NotFound),
-            status => {
-                let text = response.text().await.unwrap_or_default();
-                Err(DynaError::UnexpectedStatus(status.as_u16(), text))
+            match response.status() {
+                StatusCode::OK => {
+                    return response
+                        .json::<VersionedValue<T>>()
+                        .await
+                        .map_err(DynaError::RequestFailed);
+                }
+                StatusCode::UNAUTHORIZED if !retried => {
+                    if self.reauth().await.is_ok() {
+                        retried = true;
+                        continue;
+                    }
+                    return Err(DynaError::Unauthorized);
+                }
+                StatusCode::NOT_FOUND => return Err(DynaError::NotFound),
+                status => {
+                    let text = response.text().await.unwrap_or_default();
+                    return Err(DynaError::UnexpectedStatus(status.as_u16(), text));
+                }
             }
         }
     }
 
     /// Deletes a value. Requires the client to be authenticated as the owner.
     pub async fn delete_value(&self, table: &str, key: &str) -> Result<(), DynaError> {
-        let bearer = self.get_bearer()?;
-        let url = format!("{}/{}/key/{}", self.base_url, table, key);
+        let mut retried = false;
+        loop {
+            let bearer = self.get_bearer()?;
+            let url = format!("{}/{}/key/{}", self.base_url, table, key);
 
-        let response = self
-            .http_client
-            .delete(&url)
-            .header("Authorization", bearer)
-            .send()
-            .await
-            .map_err(DynaError::RequestFailed)?;
+            let response = self
+                .http_client
+                .delete(&url)
+                .header("Authorization", bearer)
+                .send()
+                .await
+                .map_err(DynaError::RequestFailed)?;
 
-        match response.status() {
-            StatusCode::OK => Ok(()),
-            StatusCode::NOT_FOUND => Err(DynaError::NotFound),
-            StatusCode::UNAUTHORIZED => Err(DynaError::Unauthorized),
-            status => {
-                let text = response.text().await.unwrap_or_default();
-                Err(DynaError::UnexpectedStatus(status.as_u16(), text))
+            match response.status() {
+                StatusCode::OK => return Ok(()),
+                StatusCode::NOT_FOUND => return Err(DynaError::NotFound),
+                StatusCode::UNAUTHORIZED if !retried => {
+                    if self.reauth().await.is_ok() {
+                        retried = true;
+                        continue;
+                    }
+                    return Err(DynaError::Unauthorized);
+                }
+                StatusCode::UNAUTHORIZED => return Err(DynaError::Unauthorized),
+                status => {
+                    let text = response.text().await.unwrap_or_default();
+                    return Err(DynaError::UnexpectedStatus(status.as_u16(), text));
+                }
             }
         }
     }

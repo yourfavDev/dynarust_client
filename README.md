@@ -25,7 +25,7 @@ cargo add dynarust_client
 
 ## Basic usage
 ```rust
-use dynarust_client::structs::{DynaClient, DynaError};
+use dynarust_client::models::{DynaClient, DynaError};
 use serde::{Deserialize, Serialize};
 
 // 1️⃣ Define your custom data structure
@@ -39,9 +39,9 @@ struct UserProfile {
 #[tokio::main]
 async fn main() -> Result<(), DynaError> {
     // 2️⃣ Initialize the client pointing to any node in your cluster
-    let mut client = DynaClient::new("http://localhost:6660");
+    let client = DynaClient::new("http://localhost:6660");
 
-    // 3️⃣ Authenticate (Registers if new, logs in if exists. Token is saved in client)
+    // 3️⃣ Authenticate (Registers if new, logs in if exists. Token & credentials are saved in client for auto-reauth)
     client.auth("player_1", "super_secret_password").await?;
     println!("✅ Authenticated successfully!");
 
@@ -140,11 +140,3 @@ Ensure the struct you are passing to generic methods has #[derive(Serialize, Des
 🤝 Contributing
 
 Pull requests are welcome! If you find a bug or want to help expand this client, feel free to open an issue or submit a PR on the main repository.
-
-
-***
-
-### Next Step
-To make the SSE (`subscribe`) and other missing functions actually work in your Rust code, we'll need to update `src/structs.rs` and add `reqwest-eventsource` and `futures-util` to your `Cargo.toml`. 
-
-Would you like me to write out the updated `src/structs.rs` file containing the `auth`, `put_value`, `delete_value`, and `subscribe` implementations?
