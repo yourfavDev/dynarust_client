@@ -12,6 +12,9 @@ use std::sync::{Arc, RwLock};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VersionedValue<T = Value> {
     pub value: T,
+    // Newer DynaRust servers replace the scalar `version` with a
+    // `vector_clock` map; default to 0 so both response shapes parse.
+    #[serde(default)]
     pub version: u64,
     pub timestamp: u64,
     pub owner: String,
